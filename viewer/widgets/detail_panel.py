@@ -91,7 +91,10 @@ class DetailPanel(customtkinter.CTkFrame):
         self.details_frame = customtkinter.CTkFrame(self.content, fg_color="transparent")
         self.details_frame.pack(fill="x", padx=12, pady=(0, 8))
 
-        fields = ["Date", "Time", "Duration", "Weight", "Confidence", "Sync", "Status", "Event ID"]
+        # "Material" is the physics verdict; "Status" is only pipeline
+        # completeness. A row can be fully processed and still not be gold.
+        fields = ["Date", "Time", "Duration", "Weight", "Material",
+                  "Confidence", "Sync", "Status", "Event ID"]
         self._detail_labels = {}
         for i, field in enumerate(fields):
             customtkinter.CTkLabel(
@@ -104,7 +107,7 @@ class DetailPanel(customtkinter.CTkFrame):
                 self.details_frame, text="-",
                 font=customtkinter.CTkFont(
                     size=12,
-                    weight="bold" if field in ("Weight", "Status") else "normal",
+                    weight="bold" if field in ("Weight", "Status", "Material") else "normal",
                     family="Courier New" if field == "Event ID" else None,
                 ),
                 anchor="w",
@@ -245,14 +248,41 @@ class DetailPanel(customtkinter.CTkFrame):
         sc = status_colors.get(status, ("gray40", "gray60"))
         self._detail_labels["Status"].configure(text=status, text_color=sc)
 
+        # -- material verdict from the physics stage --
+        verdict = record.get("material_verdict") or "-"
+        vcolour = {
+            "GOLD_LIKE":        ("#b8860b", "#ffd24a"),
+            "NON_GOLD_METAL":   ("gray40", "gray70"),
+            "DIELECTRIC":       ("#b02020", "#ff6b6b"),
+            "UNCERTAIN":        ("#b06000", "#ffa94d"),
+            "INVALID_CLIPPED":  ("#b06000", "#ffa94d"),
+            "INVALID_NO_SWEEP": ("gray45", "gray65"),
+        }.get(verdict, ("gray45", "gray65"))
+        pretty = {
+            "GOLD_LIKE":        "GOLD (optical)",
+            "NON_GOLD_METAL":   "metal, not gold",
+            "DIELECTRIC":       "NOT METAL",
+            "UNCERTAIN":        "uncertain",
+            "INVALID_CLIPPED":  "invalid - clipped",
+            "INVALID_NO_SWEEP": "invalid - no sweep",
+        }.get(verdict, verdict)
+        self._detail_labels["Material"].configure(text=pretty, text_color=vcolour)
+
         eid = record.get("event_id", "-")
         self._detail_labels["Event ID"].configure(
             text=eid[:18] + ".." if len(eid) > 18 else eid
         )
 
-        # Error
+        # Error / material notes. Both can be present, so neither is
+        # allowed to hide the other.
+        notes = []
         err = record.get("processing_error", "")
-        self.error_label.configure(text=f"Error: {err}" if err else "")
+        if err:
+            notes.append(f"Error: {err}")
+        reason = record.get("material_reason") or ""
+        if reason and verdict not in ("GOLD_LIKE", "-"):
+            notes.append(f"Material: {reason}")
+        self.error_label.configure(text="\n".join(notes))
 
         # Button states
         c270v = record.get("c270_video_path", "")

@@ -1,12 +1,26 @@
-# Core dependencies
+# Core detection + physics
 ultralytics>=8.0.0
 opencv-python>=4.5.0
 numpy>=1.20.0
+
+# Weight reading (OCR).
+# Note: reading the scale over RS-232/USB serial with pyserial is far more
+# reliable than OCR of its display, and would remove this ~2GB dependency.
+# See "Known gaps" in ReadME.md.
 easyocr>=1.7.0
 
 # GUI Viewer
 customtkinter>=5.0.0
 pillow>=9.0.0
 
-# Database module uses only Python built-ins (no install needed):
-# sqlite3, threading, logging, pathlib, datetime, re
+# Tests
+pytest>=7.0.0
+
+# Model B training (not needed to run the pipeline):
+#   pip install lightgbm pandas scikit-learn
+
+# Camera control locking on Linux needs v4l2-ctl:
+#   sudo apt install v4l-utils
+#
+# Database module uses only Python built-ins (sqlite3, threading, logging,
+# pathlib, datetime, re).
