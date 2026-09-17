@@ -78,6 +78,7 @@ class MaterialVerdict:
     chroma_top: float = 0.0
     chroma_mid: float = 0.0
     dynamic_range: float = 0.0
+    sweep_ratio: float = 0.0
     peak_clip_fraction: float = 0.0
     n_samples: int = 0
     n_frames: int = 0
@@ -101,6 +102,7 @@ class MaterialVerdict:
             "chroma_top": round(self.chroma_top, 5),
             "chroma_mid": round(self.chroma_mid, 5),
             "dynamic_range": round(self.dynamic_range, 3),
+            "sweep_ratio": round(self.sweep_ratio, 3),
             "peak_clip_fraction": round(self.peak_clip_fraction, 4),
             "n_samples": self.n_samples,
             "n_frames": self.n_frames,
@@ -183,10 +185,27 @@ class SweepAccumulator:
         return float(np.percentile(lum, 99)) if len(lum) else 0.0
 
     # -- statistics -------------------------------------------------------
-    def decide(self) -> MaterialVerdict:
+    def decide(self, sweep_ratio: float = 0.0,
+               sweep_observed: bool = False) -> MaterialVerdict:
+        """Rule on the accumulated samples.
+
+        `sweep_observed` defaults to False so that a caller who forgets to
+        pass it gets a refusal, never a confident wrong answer. Without a
+        real specular excursion this test cannot distinguish gold from
+        yellow plastic -- both show constant chroma across diffuse shading
+        -- so it must decline rather than guess.
+        """
         t = self.t
         v = MaterialVerdict(n_frames=self.n_frames, calibrated=self.calibrated,
-                            peak_clip_fraction=self.peak_clip_fraction)
+                            peak_clip_fraction=self.peak_clip_fraction,
+                            sweep_ratio=sweep_ratio)
+
+        if not sweep_observed or sweep_ratio < t.min_sweep_ratio:
+            v.state = Verdict.INVALID_NO_SWEEP
+            v.reason = (f"no specular excursion (peak only {sweep_ratio:.2f}x ambient, "
+                        f"need {t.min_sweep_ratio}x) -- without one, matte yellow "
+                        "plastic is indistinguishable from gold")
+            return v
 
         if not self._lum:
             v.state = Verdict.INVALID_NO_SWEEP

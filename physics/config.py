@@ -125,9 +125,14 @@ class Thresholds:
     # chroma to zero for every material.
     max_clip_fraction: float = 0.05
     min_samples: int = 4000
-    # Ratio of p99 to p50 luminance that counts as "a sweep happened".
-    # Without a real brightness excursion there is nothing to fit.
+    # Ratio of p99 to p50 luminance within the pooled samples.
     min_dynamic_range: float = 1.6
+    # Ratio of peak to baseline frame luminance, i.e. how much brighter the
+    # lamp actually made the object. This is the one that matters: pooled
+    # dynamic range can come from curvature alone, and a dielectric lit
+    # flatly shows CONSTANT chroma across its shading -- indistinguishable
+    # from metal. Only a real specular excursion separates them.
+    min_sweep_ratio: float = 1.5
 
     # --- the discriminator ----------------------------------------------
     # chroma(top luminance decile) / chroma(median band).
