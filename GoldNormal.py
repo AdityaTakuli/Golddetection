@@ -33,6 +33,12 @@ import numpy as np
 import easyocr
 from ultralytics import YOLO
 
+from physics.config import PhysicsConfig
+from physics.camera import CameraSource
+from physics.pipeline import MaterialStage
+from physics.tracker import Detection as MaterialDetection
+from physics.specular import Verdict
+
 
 # ---------------------------------------------------------------------------
 #  LOGGING
@@ -89,11 +95,30 @@ class DB:
                     processing_status   TEXT NOT NULL DEFAULT 'pending',
                     processing_error    TEXT,
 
+                    -- Material verdict from the physics stage. Kept separate
+                    -- from processing_status: a row can be fully processed and
+                    -- still carry a non-confirming verdict.
+                    material_verdict    TEXT,
+                    material_reason     TEXT,
+                    material_metrics    TEXT,
+
                     queued_at           TEXT,
                     processed_at        TEXT
                 )
             """)
+            self._migrate()
             self.conn.commit()
+
+    def _migrate(self):
+        """Add columns to databases created before the physics stage existed.
+
+        Called with the lock already held.
+        """
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(detections)")}
+        for col in ("material_verdict", "material_reason", "material_metrics"):
+            if col not in have:
+                self.conn.execute(f"ALTER TABLE detections ADD COLUMN {col} TEXT")
+                log.info("DB migrated: added column %s", col)
 
     def insert_raw_event(self, event_id, captured_at, duration_sec,
                          c270_video_path, lenovo_video_path):
@@ -114,7 +139,8 @@ class DB:
 
     def update_processed(self, event_id, weight, image_c270, image_lenovo,
                          detection_confidence=None, bbox_json=None,
-                         sync_offset_ms=None):
+                         sync_offset_ms=None, material_verdict=None,
+                         material_reason=None, material_metrics=None):
         """Called by PostProcessWorker after extraction.
         Status is 'done' if all data present, 'partial' if some missing."""
         now = datetime.now().isoformat(timespec="seconds")
@@ -129,10 +155,12 @@ class DB:
                    SET weight=?, image_c270=?, image_lenovo=?,
                        detection_confidence=?, bbox_json=?,
                        sync_offset_ms=?,
+                       material_verdict=?, material_reason=?, material_metrics=?,
                        processing_status=?, processed_at=?
                    WHERE event_id=?""",
                 (weight, image_c270, image_lenovo,
                  detection_confidence, bbox_json, sync_offset_ms,
+                 material_verdict, material_reason, material_metrics,
                  status, now, event_id),
             )
             self.conn.commit()
@@ -186,11 +214,18 @@ class LenovoCamera:
     capture_latest() returns the most recent rotated frame instantly.
     """
 
-    def __init__(self, index: int = 2):
-        self.cap = cv2.VideoCapture(index)
-        self._available = self.cap.isOpened()
-        if not self._available:
-            log.warning("Lenovo cam (index=%d) unavailable.", index)
+    def __init__(self, cfg, opener=None):
+        """cfg is a physics.config.CameraConfig, so this accepts a USB index,
+        an RTSP/HTTP dome camera over Ethernet, or a custom opener.
+        Rotation now comes from cfg.rotate rather than being hardcoded."""
+        self.cfg = cfg
+        self._source = CameraSource(cfg, opener=opener)
+        try:
+            self._source.open(lock=True)
+            self._available = True
+        except RuntimeError as exc:
+            log.warning("Context cam (%s) unavailable: %s", cfg.source, exc)
+            self._available = False
         self._frame = None
         self._lock  = threading.Lock()
         self._running = False
@@ -209,9 +244,8 @@ class LenovoCamera:
 
     def _loop(self):
         while self._running:
-            ret, frame = self.cap.read()
+            ret, frame = self._source.read()   # rotation applied by CameraSource
             if ret:
-                frame = cv2.rotate(frame, cv2.ROTATE_180)
                 with self._lock:
                     self._frame = frame
             else:
@@ -225,7 +259,7 @@ class LenovoCamera:
     def stop(self):
         self._running = False
         if self._available:
-            self.cap.release()
+            self._source.release()
 
 
 # ---------------------------------------------------------------------------
@@ -259,46 +293,91 @@ class YOLOSegmentation:
 # ---------------------------------------------------------------------------
 #  GOLD DETECTOR
 # ---------------------------------------------------------------------------
-def _overlaps_person(box_coords, person_masks, frame_shape):
-    """Pixel-level check: True if gold box overlaps any person mask."""
+def rasterise_person_mask(person_masks, frame_shape):
+    """Burn every person polygon into one mask, once per frame.
+
+    Previously this was rebuilt from scratch inside the per-box overlap
+    test, so a frame with N gold boxes allocated 2N full-frame arrays. At
+    1080p/30fps that is hundreds of MB/s of churn to answer a question that
+    only needs a lookup.
+    """
     if not person_masks:
+        return None
+    h, w = frame_shape[:2]
+    m = np.zeros((h, w), dtype=np.uint8)
+    for pts in person_masks:
+        cv2.fillPoly(m, [np.array(pts, dtype=np.int32)], 255)
+    return m
+
+
+def _overlaps_person(box_coords, person_bin):
+    """True if the box touches any person pixel. Tests the box region only."""
+    if person_bin is None:
         return False
     x1, y1, x2, y2 = box_coords
-    h, w = frame_shape[:2]
-
-    person_bin = np.zeros((h, w), dtype=np.uint8)
-    for pts in person_masks:
-        cv2.fillPoly(person_bin, [np.array(pts, dtype=np.int32)], 255)
-
-    box_mask = np.zeros((h, w), dtype=np.uint8)
-    cv2.rectangle(
-        box_mask,
-        (max(x1, 0),     max(y1, 0)),
-        (min(x2, w - 1), min(y2, h - 1)),
-        255, -1,
-    )
-    return bool(np.any(cv2.bitwise_and(person_bin, box_mask)))
+    h, w = person_bin.shape[:2]
+    x1, y1 = max(int(x1), 0), max(int(y1), 0)
+    x2, y2 = min(int(x2), w), min(int(y2), h)
+    if x2 <= x1 or y2 <= y1:
+        return False
+    return bool(person_bin[y1:y2, x1:x2].any())
 
 
 class GoldDetector:
-    def __init__(self, model_path: str):
+    """Localises ornaments. Deliberately does NOT decide what they are made of.
+
+    A detector trained on RGB crops cannot separate gold from yellow
+    plastic: under uncontrolled light they are the same pixels, so the
+    information is absent from its input. Scaling the model does not
+    create it. Material is the physics stage's call (see physics.specular);
+    this model's job is a tight mask and an ornament type.
+    """
+
+    def __init__(self, model_path: str, conf: float = 0.2):
         self.model = YOLO(model_path)
+        self.conf = conf
+        self.names = getattr(self.model, "names", {}) or {}
 
-    def detect(self, frame, person_masks):
-        """
-        Run inference on clean_frame, filter person overlaps.
-        Returns list of (x1,y1,x2,y2) in full-frame coords.
-        Does NOT draw anything.
-        """
-        results = self.model(frame, conf=0.2)[0]
+    def detect(self, frame, person_bin=None):
+        """Run inference and drop anything overlapping a person.
 
-        valid = []
-        for box in results.boxes:
+        Returns physics Detections carrying a per-object mask, so the
+        material stage samples only object pixels. Segmentation masks are
+        used when the model provides them; a detect-only model falls back
+        to the filled box, which is looser but still works.
+        """
+        results = self.model(frame, conf=self.conf, verbose=False)[0]
+        h, w = frame.shape[:2]
+
+        raw_masks = None
+        if getattr(results, "masks", None) is not None:
+            raw_masks = results.masks.data.cpu().numpy()
+
+        out = []
+        for i, box in enumerate(results.boxes):
             coords = tuple(map(int, box.xyxy[0]))
-            if _overlaps_person(coords, person_masks, frame.shape):
+            if _overlaps_person(coords, person_bin):
                 continue
-            valid.append(coords)
-        return valid
+
+            if raw_masks is not None and i < len(raw_masks):
+                m = cv2.resize((raw_masks[i] * 255).astype(np.uint8), (w, h),
+                               interpolation=cv2.INTER_NEAREST) > 127
+            else:
+                m = np.zeros((h, w), dtype=bool)
+                x1, y1, x2, y2 = coords
+                m[max(y1, 0):min(y2, h), max(x1, 0):min(x2, w)] = True
+
+            if int(m.sum()) < 100:
+                continue
+
+            cls_id = int(box.cls.item()) if box.cls is not None else -1
+            out.append(MaterialDetection(
+                box=coords,
+                mask=m,
+                confidence=float(box.conf.item()) if box.conf is not None else 0.0,
+                class_name=str(self.names.get(cls_id, "")),
+            ))
+        return out
 
     @staticmethod
     def draw_boxes(frame, gold_list):
@@ -487,8 +566,18 @@ def resize_fit(frame, max_w, max_h):
                       interpolation=cv2.INTER_LINEAR)
 
 
+VERDICT_COLOURS = {
+    "GOLD_LIKE":        (0, 215, 255),
+    "NON_GOLD_METAL":   (200, 200, 200),
+    "DIELECTRIC":       (30, 30, 200),
+    "UNCERTAIN":        (80, 160, 220),
+    "INVALID_CLIPPED":  (0, 140, 255),
+    "INVALID_NO_SWEEP": (120, 120, 120),
+}
+
+
 def draw_hud(frame, gold_detected, recording, rec_start,
-             last_weight, save_flash):
+             last_weight, save_flash, verdict=None, physics_lines=None):
     """Draw status panel on display_frame only."""
     h, w = frame.shape[:2]
     px   = w - 240
@@ -511,8 +600,19 @@ def draw_hud(frame, gold_detected, recording, rec_start,
     wt = last_weight if last_weight != "None" else "--"
     put(f"Wt:   {wt}", 135, (255, 255, 0))
 
+    y = 170
+    if verdict is not None:
+        put(f"Mat:  {verdict.state.value}", y,
+            VERDICT_COLOURS.get(verdict.state.value, (255, 255, 255)))
+        y += 30
+
+    # Operator guidance -- the sweep only works if a human knows to do it.
+    for line in (physics_lines or [])[:4]:
+        cv2.putText(frame, line[:34], (px, y), font, 0.45, (200, 200, 200), 1)
+        y += 22
+
     if save_flash:
-        put("Event saved!", 170, (0, 255, 255))
+        put("Event saved!", y, (0, 255, 255))
 
     return frame
 
@@ -527,27 +627,50 @@ class DualCameraSystem:
     """
 
     FLASH_SECS = 2.0
+    MAX_READ_FAILURES = 100   # ~3s of dead camera before giving up
 
     def __init__(
         self,
         gold_model_path: str,
         seg_model_path:  str,
-        c270_index:      int = 0,
-        lenovo_index:    int = 2,
+        config:          PhysicsConfig = None,
+        primary_opener=None,
+        context_opener=None,
+        show_window:     bool = True,
+        max_frames:      int = 0,
     ):
-        # -- cameras --
-        self.cap = cv2.VideoCapture(c270_index)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open C270 (index={c270_index})")
-        log.info("C270 opened (index=%d).", c270_index)
+        """Cameras come from PhysicsConfig, so either can be a USB index or an
+        RTSP/HTTP dome camera. `primary_opener`/`context_opener` let existing
+        connection code supply its own VideoCapture."""
+        self.cfg = config or PhysicsConfig.load()
+        # A kiosk on a Pi has no X display, and neither does a CI run.
+        self.show_window = show_window
+        self.max_frames = max_frames   # 0 = run until stopped
 
-        self.lenovo = LenovoCamera(lenovo_index)
-        self.lenovo.start()
+        # -- primary (detection) camera --
+        self.source = CameraSource(self.cfg.camera, opener=primary_opener).open(lock=True)
+        log.info("Primary camera opened: %s", self.cfg.camera.source)
+        if self.source.lock_report and not self.source.lock_report.ok:
+            log.warning(
+                "Primary camera controls are not locked. Auto exposure and auto "
+                "white balance will corrupt the material verdict -- auto-exposure "
+                "moves the gain the instant the lamp arrives, and AWB exists to "
+                "cancel exactly the colour cast the gold signal consists of."
+            )
+
+        # -- context camera (optional) --
+        ctx = self.cfg.context_camera
+        self.lenovo = LenovoCamera(ctx, opener=context_opener) if ctx else None
+        if self.lenovo is not None:
+            self.lenovo.start()
 
         # -- detection models (main thread) --
         self.seg  = YOLOSegmentation(seg_model_path)
         self.gold = GoldDetector(gold_model_path)
         self.ocr  = OCRReader()
+
+        # -- physics: the stage that actually decides material --
+        self.material = MaterialStage(self.cfg)
 
         # -- subsystems --
         self.recorder = DualVideoRecorder()
@@ -560,6 +683,7 @@ class DualCameraSystem:
         self._last_ocr_t     = 0.0
         self._last_weight    = "None"
         self._stop           = False
+        self._read_failures  = 0
 
         # Snapshot data captured when gold first appears
         self._pending          = None
@@ -592,32 +716,30 @@ class DualCameraSystem:
         y2 = max(b[3] for b in gold_list)
         return (x1, y1, x2, y2)
 
-    def _on_gold_first_seen(self, clean_frame, gold_list, event_id):
+    def _on_gold_first_seen(self, clean_frame, detections, event_id):
         """
-        Called once when gold first appears. Captures snapshots + OCR
+        Called once when an ornament first appears. Captures snapshots + OCR
         using the already-loaded models. No background worker needed.
+
+        Note this is only the *localisation* event -- it does not mean gold.
+        The material verdict arrives later, once a sweep has been observed.
         """
         ts = datetime.now().isoformat(timespec="seconds")
 
-        # C270 gold crop (union of all valid gold boxes)
-        union = self._union_box(gold_list)
+        union = self._union_box([d.box for d in detections])
         img_c270 = self._save_snapshot(clean_frame, "c270_crop", event_id, crop_box=union)
 
-        # Best confidence from gold_list
-        # (gold_list only has coords; re-run to get confidence)
-        best_conf = None
+        # Confidence comes from the detections we already have. The previous
+        # version re-ran the model here purely to recover a number it had
+        # just discarded.
+        best_conf = round(max((d.confidence for d in detections), default=0.0), 4) or None
         bbox_dict = None
         if union:
             bbox_dict = {"x1": union[0], "y1": union[1],
                          "x2": union[2], "y2": union[3]}
-            # Get confidence from last detect call
-            results = self.gold.model(clean_frame, conf=0.2, verbose=False)[0]
-            if results.boxes is not None and len(results.boxes) > 0:
-                best_conf = max(box.conf.item() for box in results.boxes)
-                best_conf = round(best_conf, 4)
 
         # Lenovo frame
-        lenovo_frm = self.lenovo.capture_latest()
+        lenovo_frm = self.lenovo.capture_latest() if self.lenovo else None
         img_lenovo = self._save_snapshot(lenovo_frm, "lenovo_frame", event_id) \
             if lenovo_frm is not None else None
 
@@ -631,6 +753,9 @@ class DualCameraSystem:
             "image_lenovo":         img_lenovo,
             "detection_confidence": best_conf,
             "bbox_json":            _json.dumps(bbox_dict) if bbox_dict else None,
+            "material":             None,
+            "ornament_type":        next((d.class_name for d in detections
+                                          if d.class_name), ""),
         }
         # Start 5-second OCR settle timer
         self._ocr_settle_start = time.time()
@@ -655,11 +780,23 @@ class DualCameraSystem:
         # First insert the raw event
         row_id = self.db.insert_raw_event(**completed)
 
-        # Determine status
+        # processing_status is about pipeline completeness, not about
+        # whether the piece is gold -- those are different questions and
+        # collapsing them would let a DIELECTRIC verdict read as success.
         if ev["image_c270"] and ev["weight"] and ev["weight"] != "None":
             status = "done"
         else:
             status = "partial"
+
+        verdict = ev.get("material")
+        if verdict is None:
+            v_state = Verdict.INVALID_NO_SWEEP.value
+            v_reason = "capture ended before a sweep was observed"
+            v_metrics = None
+        else:
+            v_state = verdict.state.value
+            v_reason = verdict.reason
+            v_metrics = _json.dumps(verdict.as_dict())
 
         # Then immediately update with the inline-captured data
         self.db.update_processed(
@@ -670,10 +807,16 @@ class DualCameraSystem:
             detection_confidence=ev["detection_confidence"],
             bbox_json=ev["bbox_json"],
             sync_offset_ms=0,  # inline capture = same moment
+            material_verdict=v_state,
+            material_reason=v_reason,
+            material_metrics=v_metrics,
         )
 
-        log.info("DB row #%d written (%s)  event=%s  weight=%s",
-                 row_id, status, completed["event_id"], ev["weight"])
+        log.info("DB row #%d written (%s)  event=%s  weight=%s  material=%s",
+                 row_id, status, completed["event_id"], ev["weight"], v_state)
+        if v_state != Verdict.GOLD_LIKE.value:
+            log.warning("Event %s NOT confirmed as gold: %s",
+                        completed["event_id"], v_reason)
 
         self._pending      = None
         self._save_flash_t = time.time()
@@ -681,36 +824,60 @@ class DualCameraSystem:
     # -- main loop --
     def run(self):
         win = "Gold Detection"
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        res = get_screen_resolution()
-        disp_w, disp_h = res if res else (1280, 720)
-        cv2.resizeWindow(win, disp_w, disp_h)
+        disp_w, disp_h = 1280, 720
+        if self.show_window:
+            cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            res = get_screen_resolution()
+            disp_w, disp_h = res if res else (1280, 720)
+            cv2.resizeWindow(win, disp_w, disp_h)
+            log.info("Main loop running -- press Q to quit.")
+        else:
+            log.info("Main loop running headless.")
 
-        log.info("Main loop running -- press Q to quit.")
-
+        frames_done = 0
         while not self._stop:
-            ret, frame = self.cap.read()
+            if self.max_frames and frames_done >= self.max_frames:
+                break
+            frames_done += 1
+            ret, frame = self.source.read()
             if not ret:
-                log.warning("C270 read failed -- retrying...")
+                self._read_failures += 1
+                # A stream reconnects itself; a USB camera that has stopped
+                # answering is unplugged or wedged, and spinning on it
+                # forever just fills the log.
+                if (not self.cfg.camera.is_stream
+                        and self._read_failures >= self.MAX_READ_FAILURES):
+                    log.error("Primary camera gave %d consecutive read failures "
+                              "-- stopping.", self._read_failures)
+                    break
+                if self._read_failures % 30 == 1:
+                    log.warning("Primary camera read failed (%d) -- retrying...",
+                                self._read_failures)
                 time.sleep(0.03)
                 continue
+            self._read_failures = 0
 
-            # -- 1. rotate 180 --
-            frame = cv2.rotate(frame, cv2.ROTATE_180)
-
-            # -- 2. clean_frame = unannotated source of truth --
+            # -- 1. clean_frame = unannotated source of truth --
+            # (rotation already applied by CameraSource per cfg.rotate)
             clean_frame = frame.copy()
 
-            # -- 3. person segmentation (runs on clean_frame) --
+            # -- 2. person segmentation (runs on clean_frame) --
             seg_results  = self.seg.run(clean_frame)
             person_masks = seg_results.masks.xy if seg_results.masks else None
+            person_bin   = rasterise_person_mask(person_masks, clean_frame.shape)
 
-            # -- 4. gold detection (on clean_frame, returns coords only) --
-            gold_list     = self.gold.detect(clean_frame, person_masks)
-            gold_detected = len(gold_list) > 0
+            # -- 3. localise ornaments (material is decided later, by physics) --
+            detections    = self.gold.detect(clean_frame, person_bin)
+            gold_list     = [d.box for d in detections]
+            gold_detected = len(detections) > 0
 
-            # -- 5. get latest Lenovo frame --
-            lenovo_frame = self.lenovo.capture_latest()
+            # -- 4. physics stage: the actual material test --
+            # Same frame, same masks, same instant -- the consistency the
+            # old threaded sweep worker could not guarantee.
+            material = self.material.process(clean_frame, detections)
+
+            # -- 5. get latest context frame --
+            lenovo_frame = self.lenovo.capture_latest() if self.lenovo else None
 
             # -- 6. dual recording (writes clean frames only) --
             recording, just_stopped, completed = self.recorder.feed(
@@ -722,13 +889,17 @@ class DualCameraSystem:
                 # Gold just appeared -> first frame of recording
                 self._rec_start = time.time()
                 event_id = self.recorder.event_id
-                self._on_gold_first_seen(clean_frame, gold_list, event_id)
+                self.material.reset()   # new capture event, new sweep
+                self._on_gold_first_seen(clean_frame, detections, event_id)
 
             elif not recording and self._prev_recording:
                 self._rec_start = None
 
             if just_stopped and completed:
                 self._on_recording_done(completed)
+
+            if self._pending is not None and material.verdict is not None:
+                self._pending["material"] = material.verdict
 
             self._prev_recording = recording
 
@@ -757,11 +928,14 @@ class DualCameraSystem:
             display_frame = draw_hud(
                 display_frame, gold_detected, recording,
                 self._rec_start, self._last_weight, save_flash,
+                verdict=material.verdict,
+                physics_lines=self.material.hud_lines(material),
             )
 
-            cv2.imshow(win, resize_fit(display_frame, disp_w, disp_h))
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+            if self.show_window:
+                cv2.imshow(win, resize_fit(display_frame, disp_w, disp_h))
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
 
         # -- shutdown --
         log.info("Shutting down...")
@@ -769,23 +943,76 @@ class DualCameraSystem:
         if completed:
             self._on_recording_done(completed)
 
-        self.cap.release()
-        self.lenovo.stop()
-        cv2.destroyAllWindows()
+        self.source.release()
+        if self.lenovo:
+            self.lenovo.stop()
+        if self.show_window:
+            cv2.destroyAllWindows()
         log.info("Done.")
 
 
 # ---------------------------------------------------------------------------
 #  ENTRY POINT
 # ---------------------------------------------------------------------------
+def _build_arg_parser():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Gold detection with physics-based material verification")
+    ap.add_argument("--config", default=None,
+                    help="path to physics config JSON (default config/physics.json)")
+    ap.add_argument("--camera", default=None,
+                    help="override primary camera: a USB index (0) or a stream "
+                         "URL (rtsp://user:pass@host:554/...)")
+    ap.add_argument("--context-camera", default=None,
+                    help="override context camera; same forms as --camera")
+    ap.add_argument("--rotate", type=int, default=None, choices=[0, 90, 180, 270],
+                    help="rotate primary camera frames")
+    ap.add_argument("--gold-model", default="weights/GoldSegmentationbest1.pt")
+    ap.add_argument("--seg-model", default="weights/yolo26n-seg.onnx")
+    ap.add_argument("--headless", action="store_true",
+                    help="run without a display window (kiosk / SSH / Pi)")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="skip camera control locking (NOT recommended: auto "
+                         "exposure and auto white balance corrupt the verdict)")
+    return ap
+
+
+def _as_source(text):
+    """"0" -> 0 (USB index); anything with a scheme stays a URL."""
+    return int(text) if text.isdigit() else text
+
+
 if __name__ == "__main__":
     import signal
 
+    args = _build_arg_parser().parse_args()
+    cfg = PhysicsConfig.load(args.config)
+
+    if args.camera is not None:
+        cfg.camera.source = _as_source(args.camera)
+    if args.rotate is not None:
+        cfg.camera.rotate = args.rotate
+    if args.context_camera is not None:
+        from physics.config import CameraConfig
+        cfg.context_camera = cfg.context_camera or CameraConfig(name="context")
+        cfg.context_camera.source = _as_source(args.context_camera)
+    if args.no_lock:
+        cfg.camera.lock_controls = False
+        if cfg.context_camera:
+            cfg.context_camera.lock_controls = False
+
+    if not cfg.chips.configured:
+        log.warning(
+            "No reference patch configured. The system will run, but chroma is "
+            "measured against an assumed neutral illuminant and thresholds will "
+            "drift. Run:  python3 tools/calibrate_chips.py"
+        )
+
     system = DualCameraSystem(
-        gold_model_path = "weights/GoldSegmentationbest1.pt",
-        seg_model_path  = "weights/yolo26n-seg.onnx",
-        c270_index      = 0,
-        lenovo_index    = 2,
+        gold_model_path = args.gold_model,
+        seg_model_path  = args.seg_model,
+        config          = cfg,
+        show_window     = not args.headless,
     )
 
     _stop_flag = False
