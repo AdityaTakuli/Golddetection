@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Runtime output
+runs/
+dataset/
+*.log
+
+# Local calibration (machine-specific: camera IDs, chip positions)
+config/physics.local.json
